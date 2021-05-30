@@ -2,7 +2,10 @@ extern crate anyhow;
 extern crate clap;
 extern crate cpal;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    RecoveryMode,
+};
 
 #[derive(Debug)]
 struct Opt {
@@ -111,6 +114,7 @@ where
             write_data(data, channels, &mut next_value)
         },
         err_fn,
+        RecoveryMode::DefaultDevice,
     )?;
     stream.play()?;
 

@@ -160,3 +160,13 @@ pub enum StreamError {
         err: BackendSpecificError,
     },
 }
+
+impl StreamError {
+    pub fn is_disconnect(&self) -> bool {
+        if let Self::DeviceNotAvailable = self {
+            true
+        } else {
+            false
+        }
+    }
+}

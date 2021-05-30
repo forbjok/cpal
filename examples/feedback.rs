@@ -12,7 +12,10 @@ extern crate cpal;
 extern crate ringbuf;
 
 use anyhow::Context;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    RecoveryMode,
+};
 use ringbuf::RingBuffer;
 
 #[derive(Debug)]
@@ -173,7 +176,12 @@ fn main() -> anyhow::Result<()> {
         config
     );
     let input_stream = input_device.build_input_stream(&config, input_data_fn, err_fn)?;
-    let output_stream = output_device.build_output_stream(&config, output_data_fn, err_fn)?;
+    let output_stream = output_device.build_output_stream(
+        &config,
+        output_data_fn,
+        err_fn,
+        RecoveryMode::DefaultDevice,
+    )?;
     println!("Successfully built streams.");
 
     // Play the streams.

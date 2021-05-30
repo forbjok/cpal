@@ -1,5 +1,7 @@
 //! The suite of traits allowing CPAL to abstract over hosts, devices, event loops and stream IDs.
 
+use crate::RecoveryMode;
+
 use {
     BuildStreamError, Data, DefaultStreamConfigError, DeviceNameError, DevicesError,
     InputCallbackInfo, InputDevices, OutputCallbackInfo, OutputDevices, PauseStreamError,
@@ -146,6 +148,7 @@ pub trait DeviceTrait {
         config: &StreamConfig,
         mut data_callback: D,
         error_callback: E,
+        recovery_mode: RecoveryMode,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         T: Sample,
@@ -163,6 +166,7 @@ pub trait DeviceTrait {
                 )
             },
             error_callback,
+            recovery_mode,
         )
     }
 
@@ -185,6 +189,7 @@ pub trait DeviceTrait {
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
+        recovery_mode: RecoveryMode,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,

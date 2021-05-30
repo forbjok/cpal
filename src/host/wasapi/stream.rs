@@ -1,4 +1,3 @@
-use super::check_result;
 use super::winapi::shared::basetsd::{UINT32, UINT64};
 use super::winapi::shared::minwindef::{BYTE, FALSE, WORD};
 use super::winapi::um::audioclient::{self, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_S_BUFFER_EMPTY};
@@ -6,15 +5,17 @@ use super::winapi::um::handleapi;
 use super::winapi::um::synchapi;
 use super::winapi::um::winbase;
 use super::winapi::um::winnt;
-use crate::traits::StreamTrait;
+use super::{check_result, Host};
+use crate::traits::{HostTrait, StreamTrait};
 use crate::{
-    BackendSpecificError, Data, InputCallbackInfo, OutputCallbackInfo, PauseStreamError,
-    PlayStreamError, SampleFormat, StreamError,
+    BackendSpecificError, Data, InputCallbackInfo, OutputCallbackInfo, OutputStreamTimestamp,
+    PauseStreamError, PlayStreamError, RecoveryMode, SampleFormat, StreamError, StreamInstant,
 };
 use std::mem;
 use std::ptr;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 pub struct Stream {
     /// The high-priority audio processing thread calling callbacks.
@@ -42,6 +43,8 @@ struct RunContext {
     handles: Vec<winnt::HANDLE>,
 
     commands: Receiver<Command>,
+
+    recovery_mode: RecoveryMode,
 }
 
 // Once we start running the eventloop, the RunContext will not be moved.
@@ -66,6 +69,7 @@ pub struct StreamInner {
     pub audio_client: *mut audioclient::IAudioClient,
     pub audio_clock: *mut audioclient::IAudioClock,
     pub client_flow: AudioClientFlow,
+    pub device_name: Option<String>,
     // Event that is signalled by WASAPI whenever audio data must be written.
     pub event: winnt::HANDLE,
     // True if the stream is currently playing. False if paused.
@@ -98,6 +102,7 @@ impl Stream {
             handles: vec![pending_scheduled_event, stream_inner.event],
             stream: stream_inner,
             commands: rx,
+            recovery_mode: RecoveryMode::None,
         };
 
         let thread = thread::Builder::new()
@@ -116,6 +121,7 @@ impl Stream {
         stream_inner: StreamInner,
         mut data_callback: D,
         mut error_callback: E,
+        recovery_mode: RecoveryMode,
     ) -> Stream
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
@@ -129,6 +135,7 @@ impl Stream {
             handles: vec![pending_scheduled_event, stream_inner.event],
             stream: stream_inner,
             commands: rx,
+            recovery_mode,
         };
 
         let thread = thread::Builder::new()
@@ -293,6 +300,7 @@ fn run_input(
         match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
             Some(ControlFlow::Break) => break,
             Some(ControlFlow::Continue) => continue,
+            Some(ControlFlow::Disconnected) => break,
             None => (),
         }
         let capture_client = match run_ctxt.stream.client_flow {
@@ -307,7 +315,87 @@ fn run_input(
         ) {
             ControlFlow::Break => break,
             ControlFlow::Continue => continue,
+            ControlFlow::Disconnected => break,
         }
+    }
+}
+
+/// Attempt to recover this run context by creating a new
+/// device based on the RecoveryMode and replacing the
+/// inner stream.
+fn recover_output(run_ctxt: &mut RunContext) -> bool {
+    let old_stream = &run_ctxt.stream;
+
+    let host = Host::new().unwrap();
+    let new_device = match run_ctxt.recovery_mode {
+        RecoveryMode::DefaultDevice => host.default_output_device(),
+        RecoveryMode::SameDevice => host
+            .output_devices()
+            .unwrap()
+            .filter(|d| d.name().ok() == old_stream.device_name)
+            .next(),
+        RecoveryMode::None => return false,
+    };
+
+    if let Some(device) = new_device {
+        // TODO: Handle potential errors here?
+        if let Ok(mut new_stream) =
+            device.build_output_stream_raw_inner(&old_stream.config, old_stream.sample_format)
+        {
+            if old_stream.playing {
+                let hresult = unsafe { (*new_stream.audio_client).Start() };
+
+                if let Err(_) = stream_error_from_hresult(hresult) {
+                    return false;
+                }
+                new_stream.playing = true;
+            }
+
+            // Replace stream wait handle handle with that of the new stream
+            run_ctxt.handles[1] = new_stream.event;
+
+            // Replace inner stream
+            run_ctxt.stream = new_stream;
+
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Drain a specified number of seconds worth of data from the data callback.
+/// This is used while in a disconnected state, to prevent a potentially
+/// infinite amount of data piling up and being played back all at once
+/// when the stream is recovered, because that doesn't seem desirable.
+/// Maybe there is a better way to handle this?
+fn drain_data(
+    stream: &StreamInner,
+    data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
+    seconds_to_drain: f32,
+) {
+    let sample_rate = stream.config.sample_rate.0;
+
+    let frames_available = (sample_rate as f32 * seconds_to_drain) as usize;
+    let len = frames_available as usize * stream.bytes_per_frame as usize;
+
+    // Create buffer large enough for the drained samples
+    let mut buffer: Vec<u8> = Vec::with_capacity(len);
+
+    unsafe {
+        let data = buffer.as_mut_ptr() as *mut ();
+        let len = len / stream.sample_format.sample_size();
+        let mut data = Data::from_parts(data, len, stream.sample_format);
+
+        // TODO: Not really sure what exactly this is used for,
+        //       might be good to use better values for this?
+        let timestamp = OutputStreamTimestamp {
+            callback: StreamInstant::from_nanos(0),
+            playback: StreamInstant::from_nanos(0),
+        };
+        let info = OutputCallbackInfo { timestamp };
+
+        data_callback(&mut data, &info);
     }
 }
 
@@ -316,24 +404,63 @@ fn run_output(
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
     error_callback: &mut dyn FnMut(StreamError),
 ) {
-    loop {
-        match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
-            Some(ControlFlow::Break) => break,
-            Some(ControlFlow::Continue) => continue,
-            None => (),
+    const RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+
+    let mut disconnected = false;
+    let mut last_drain_at: Option<Instant> = None;
+
+    // Reconnect loop
+    // If the device gets disconnected, we will drop out of the
+    // main processing loop and back into this one in order
+    // to try to recover from the disconnect.
+    'outer: loop {
+        if disconnected {
+            if run_ctxt.recovery_mode != RecoveryMode::None {
+                let now = Instant::now();
+                if let Some(last_drain_at) = last_drain_at.replace(now) {
+                    let seconds_to_drain = (now - last_drain_at).as_secs_f32();
+                    drain_data(&run_ctxt.stream, data_callback, seconds_to_drain);
+                }
+
+                if !recover_output(&mut run_ctxt) {
+                    std::thread::sleep(RECOVERY_INTERVAL);
+                    continue;
+                }
+
+                last_drain_at = None;
+            } else {
+                break;
+            }
         }
-        let render_client = match run_ctxt.stream.client_flow {
-            AudioClientFlow::Render { render_client } => render_client,
-            _ => unreachable!(),
-        };
-        match process_output(
-            &mut run_ctxt.stream,
-            render_client,
-            data_callback,
-            error_callback,
-        ) {
-            ControlFlow::Break => break,
-            ControlFlow::Continue => continue,
+
+        // Main processing loop
+        loop {
+            match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
+                Some(ControlFlow::Break) => break 'outer,
+                Some(ControlFlow::Continue) => continue,
+                Some(ControlFlow::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+                None => (),
+            }
+            let render_client = match run_ctxt.stream.client_flow {
+                AudioClientFlow::Render { render_client } => render_client,
+                _ => unreachable!(),
+            };
+            match process_output(
+                &mut run_ctxt.stream,
+                render_client,
+                data_callback,
+                error_callback,
+            ) {
+                ControlFlow::Break => break 'outer,
+                ControlFlow::Continue => continue,
+                ControlFlow::Disconnected => {
+                    disconnected = true;
+                    break;
+                }
+            }
         }
     }
 }
@@ -341,6 +468,7 @@ fn run_output(
 enum ControlFlow {
     Break,
     Continue,
+    Disconnected,
 }
 
 fn process_commands_and_await_signal(
@@ -352,7 +480,14 @@ fn process_commands_and_await_signal(
         Ok(true) => (),
         Ok(false) => return Some(ControlFlow::Break),
         Err(err) => {
+            let disconnected = err.is_disconnect();
+
             error_callback(err);
+
+            if disconnected {
+                return Some(ControlFlow::Disconnected);
+            }
+
             return Some(ControlFlow::Break);
         }
     };
@@ -361,7 +496,15 @@ fn process_commands_and_await_signal(
     let handle_idx = match wait_for_handle_signal(&run_context.handles) {
         Ok(idx) => idx,
         Err(err) => {
-            error_callback(err.into());
+            let err: StreamError = err.into();
+            let disconnected = err.is_disconnect();
+
+            error_callback(err);
+
+            if disconnected {
+                return Some(ControlFlow::Disconnected);
+            }
+
             return Some(ControlFlow::Break);
         }
     };
@@ -443,7 +586,7 @@ fn process_input(
 
 // The loop for writing output data.
 fn process_output(
-    stream: &StreamInner,
+    stream: &mut StreamInner,
     render_client: *mut audioclient::IAudioRenderClient,
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
     error_callback: &mut dyn FnMut(StreamError),
@@ -453,7 +596,14 @@ fn process_output(
         Ok(0) => return ControlFlow::Continue, // TODO: Can this happen?
         Ok(n) => n,
         Err(err) => {
+            let disconnected = err.is_disconnect();
+
             error_callback(err);
+
+            if disconnected {
+                return ControlFlow::Disconnected;
+            }
+
             return ControlFlow::Break;
         }
     };
@@ -463,7 +613,14 @@ fn process_output(
         let hresult = (*render_client).GetBuffer(frames_available, &mut buffer as *mut *mut _);
 
         if let Err(err) = stream_error_from_hresult(hresult) {
+            let disconnected = err.is_disconnect();
+
             error_callback(err);
+
+            if disconnected {
+                return ControlFlow::Disconnected;
+            }
+
             return ControlFlow::Break;
         }
 
@@ -477,7 +634,14 @@ fn process_output(
         let timestamp = match output_timestamp(stream, frames_available, sample_rate) {
             Ok(ts) => ts,
             Err(err) => {
+                let disconnected = err.is_disconnect();
+
                 error_callback(err);
+
+                if disconnected {
+                    return ControlFlow::Disconnected;
+                }
+
                 return ControlFlow::Break;
             }
         };
@@ -486,7 +650,14 @@ fn process_output(
 
         let hresult = (*render_client).ReleaseBuffer(frames_available as u32, 0);
         if let Err(err) = stream_error_from_hresult(hresult) {
+            let disconnected = err.is_disconnect();
+
             error_callback(err);
+
+            if disconnected {
+                return ControlFlow::Disconnected;
+            }
+
             return ControlFlow::Break;
         }
     }

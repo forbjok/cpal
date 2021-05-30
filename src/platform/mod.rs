@@ -287,6 +287,7 @@ macro_rules! impl_platform_host {
                 sample_format: crate::SampleFormat,
                 data_callback: D,
                 error_callback: E,
+                recovery_mode: crate::RecoveryMode,
             ) -> Result<Self::Stream, crate::BuildStreamError>
             where
                 D: FnMut(&mut crate::Data, &crate::OutputCallbackInfo) + Send + 'static,
@@ -300,6 +301,7 @@ macro_rules! impl_platform_host {
                                 sample_format,
                                 data_callback,
                                 error_callback,
+                                recovery_mode,
                             )
                             .map(StreamInner::$HostVariant)
                             .map(Stream::from),

@@ -3,7 +3,10 @@
 extern crate anyhow;
 extern crate cpal;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    RecoveryMode,
+};
 
 #[cfg_attr(target_os = "android", ndk_glue::main(backtrace = "full"))]
 fn main() {
@@ -44,6 +47,7 @@ where
             write_data(data, channels, &mut next_value)
         },
         err_fn,
+        RecoveryMode::DefaultDevice,
     )?;
     stream.play()?;
 

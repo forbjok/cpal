@@ -1,3 +1,4 @@
+use crate::RecoveryMode;
 use crate::{
     BackendSpecificError, BufferSize, Data, DefaultStreamConfigError, DeviceNameError,
     DevicesError, InputCallbackInfo, OutputCallbackInfo, SampleFormat, SampleRate, StreamConfig,
@@ -122,6 +123,7 @@ impl DeviceTrait for Device {
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
+        recovery_mode: RecoveryMode,
     ) -> Result<Self::Stream, BuildStreamError>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
@@ -132,6 +134,7 @@ impl DeviceTrait for Device {
             stream_inner,
             data_callback,
             error_callback,
+            recovery_mode,
         ))
     }
 }
@@ -778,10 +781,13 @@ impl Device {
                 err
             })?;
 
+            let device_name = self.name().ok();
+
             Ok(StreamInner {
                 audio_client,
                 audio_clock,
                 client_flow,
+                device_name,
                 event,
                 playing: false,
                 max_frames_in_buffer,
@@ -941,10 +947,13 @@ impl Device {
                 err
             })?;
 
+            let device_name = self.name().ok();
+
             Ok(StreamInner {
                 audio_client,
                 audio_clock,
                 client_flow,
+                device_name,
                 event,
                 playing: false,
                 max_frames_in_buffer,
